@@ -27,7 +27,7 @@
         type="text"
         autocomplete="off"
         autocapitalize="none"
-        placeholder="Add charger by ID, e.g. ax-33"
+        placeholder="Add charger by ID"
       />
       <button type="submit">Add</button>
     </form>
@@ -167,6 +167,23 @@
       };
       const titleCase = (s) =>
         s ? s.charAt(0) + s.slice(1).toLowerCase() : "Unknown";
+      // Build a maps link that opens the platform's default maps app.
+      const IS_APPLE = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent);
+      function mapsUrl(loc) {
+        const q = encodeURIComponent(
+          [loc.streetAddress, loc.city, loc.stateOrRegion, loc.zipOrPostalCode]
+            .filter(Boolean)
+            .join(", "),
+        );
+        const ll =
+          loc.latitude != null && loc.longitude != null
+            ? `${loc.latitude},${loc.longitude}`
+            : "";
+        // Apple universal link → opens Apple Maps app on iOS/macOS; Google elsewhere.
+        return IS_APPLE
+          ? `https://maps.apple.com/?q=${q}` + (ll ? `&ll=${ll}` : "")
+          : `https://www.google.com/maps/search/?api=1&query=${ll || q}`;
+      }
 
       /* ---------- Cognito ---------- */
       async function cognito(target, body) {
@@ -338,7 +355,44 @@
           sec.append(el("p", { text: "Could not load." }));
           return sec;
         }
-        if (chg.location) sec.append(el("p", { text: chg.location.name }));
+        if (chg.location) {
+          const loc = chg.location;
+          sec.append(el("p", { text: loc.name }));
+          const addr = [
+            loc.streetAddress,
+            loc.city,
+            loc.stateOrRegion,
+            loc.zipOrPostalCode,
+          ]
+            .filter(Boolean)
+            .join(", ");
+          if (addr) {
+            sec.append(
+              el("p", {}, [el("a", { href: mapsUrl(loc), text: addr })]),
+            );
+          }
+        }
+
+        // Notes / details in a native collapsible element.
+        const notes = [];
+        if (chg.description) notes.push(chg.description);
+        if (chg.directions && chg.directions !== chg.description)
+          notes.push(chg.directions);
+        if (notes.length || chg.contactInfo) {
+          const d = el("details");
+          d.append(el("summary", { text: "Notes" }));
+          notes.forEach((n) => d.append(el("p", { text: n })));
+          if (chg.contactInfo)
+            d.append(
+              el("p", {}, [
+                el("a", {
+                  href: "tel:" + chg.contactInfo,
+                  text: "Support: " + chg.contactInfo,
+                }),
+              ]),
+            );
+          sec.append(d);
+        }
 
         const ul = el("ul");
         (chg.ports || []).forEach((p) => {

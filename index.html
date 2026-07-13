@@ -374,10 +374,10 @@
         }
 
         // Notes / details in a native collapsible element.
+        // Official site shows only `directions` (falling back to `description`).
         const notes = [];
-        if (chg.description) notes.push(chg.description);
-        if (chg.directions && chg.directions !== chg.description)
-          notes.push(chg.directions);
+        const note = chg.directions || chg.description;
+        if (note) notes.push(note);
         if (notes.length || chg.contactInfo) {
           const d = el("details");
           d.append(el("summary", { text: "Notes" }));

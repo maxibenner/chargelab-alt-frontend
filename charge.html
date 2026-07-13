@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Charge</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ChargeLab</h1>
+      <p id="authArea"></p>
+    </header>
+
+    <p id="banner"></p>
+    <div id="chargers"></div>
+
+    <form id="loginCard" hidden>
+      <h2>Sign in</h2>
+      <fieldset id="step-email">
+        <legend>Email</legend>
+        <p>A 5-digit code is emailed to you (no password).</p>
+        <input
+          id="email"
+          type="email"
+          inputmode="email"
+          autocomplete="email"
+          placeholder="you@example.com"
+        />
+        <button id="sendBtn" type="button">Send code</button>
+      </fieldset>
+      <fieldset id="step-code" hidden>
+        <legend>Code</legend>
+        <p>Code sent to <span id="emailEcho"></span>.</p>
+        <input
+          id="code"
+          type="text"
+          inputmode="numeric"
+          autocomplete="one-time-code"
+          placeholder="12345"
+        />
+        <button id="verifyBtn" type="button">Sign in</button>
+        <button id="restartLogin" type="button">Use a different email</button>
+      </fieldset>
+      <p id="loginErr"></p>
+    </form>
+
+    <script>
+      "use strict";
+      /* ---------- Config (extracted from charge.id / ChargeLab) ---------- */
+      const CFG = {
+        cognitoUrl: "https://cognito-idp.us-east-1.amazonaws.com/",
+        clientId: "70ecu0f57h1e5n9cg7vitjqtqs",
+        apiBase: "https://api-v1-blue.chargelab.io",
+        chargers: [
+          { name: "ax-62", label: "AX-62 (West)" },
+          { name: "ax-63", label: "AX-63 (East)" },
+        ],
+      };
+      const LS = {
+        get access() {
+          return localStorage.getItem("cl_access");
+        },
+        set access(v) {
+          v
+            ? localStorage.setItem("cl_access", v)
+            : localStorage.removeItem("cl_access");
+        },
+        get exp() {
+          return +localStorage.getItem("cl_exp") || 0;
+        },
+        set exp(v) {
+          v
+            ? localStorage.setItem("cl_exp", v)
+            : localStorage.removeItem("cl_exp");
+        },
+        get refresh() {
+          return localStorage.getItem("cl_refresh");
+        },
+        set refresh(v) {
+          v
+            ? localStorage.setItem("cl_refresh", v)
+            : localStorage.removeItem("cl_refresh");
+        },
+        get email() {
+          return localStorage.getItem("cl_email");
+        },
+        set email(v) {
+          v
+            ? localStorage.setItem("cl_email", v)
+            : localStorage.removeItem("cl_email");
+        },
+        clear() {
+          ["cl_access", "cl_exp", "cl_refresh", "cl_email"].forEach((k) =>
+            localStorage.removeItem(k),
+          );
+        },
+      };
+
+      /* ---------- tiny DOM helpers ---------- */
+      const $ = (s) => document.querySelector(s);
+      const el = (t, props = {}, kids = []) => {
+        const n = document.createElement(t);
+        Object.entries(props).forEach(([k, v]) =>
+          k === "text"
+            ? (n.textContent = v)
+            : k.startsWith("on")
+              ? n.addEventListener(k.slice(2), v)
+              : n.setAttribute(k, v),
+        );
+        (Array.isArray(kids) ? kids : [kids]).forEach(
+          (c) => c != null && n.append(c),
+        );
+        return n;
+      };
+      const banner = (msg) => {
+        $("#banner").textContent = msg || "";
+      };
+      const titleCase = (s) =>
+        s ? s.charAt(0) + s.slice(1).toLowerCase() : "Unknown";
+
+      /* ---------- Cognito ---------- */
+      async function cognito(target, body) {
+        const r = await fetch(CFG.cognitoUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-amz-json-1.1",
+            "x-amz-target": "AWSCognitoIdentityProviderService." + target,
+          },
+          body: JSON.stringify(body),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const e = new Error(j.message || j.__type || "HTTP " + r.status);
+          e.data = j;
+          throw e;
+        }
+        return j;
+      }
+      function storeTokens(auth) {
+        LS.access = auth.AccessToken;
+        LS.exp = Date.now() + (auth.ExpiresIn || 3600) * 1000;
+        if (auth.RefreshToken) LS.refresh = auth.RefreshToken;
+      }
+      async function accessToken() {
+        if (LS.access && LS.exp > Date.now() + 60000) return LS.access;
+        if (LS.refresh) {
+          try {
+            const j = await cognito("InitiateAuth", {
+              AuthFlow: "REFRESH_TOKEN_AUTH",
+              ClientId: CFG.clientId,
+              AuthParameters: { REFRESH_TOKEN: LS.refresh },
+            });
+            if (j.AuthenticationResult) {
+              storeTokens(j.AuthenticationResult);
+              return LS.access;
+            }
+          } catch (e) {
+            /* fall through */
+          }
+        }
+        return null;
+      }
+      const isLoggedIn = () =>
+        !!(LS.refresh || (LS.access && LS.exp > Date.now()));
+
+      /* login step 1+2: request the email code */
+      async function requestCode(email) {
+        const r1 = await cognito("InitiateAuth", {
+          AuthFlow: "CUSTOM_AUTH",
+          ClientId: CFG.clientId,
+          AuthParameters: { USERNAME: email },
+          ClientMetadata: {},
+        });
+        const r2 = await cognito("RespondToAuthChallenge", {
+          ChallengeName: "CUSTOM_CHALLENGE",
+          ClientId: CFG.clientId,
+          Session: r1.Session,
+          ChallengeResponses: { USERNAME: email, ANSWER: email },
+          ClientMetadata: { isEmail: "true" },
+        });
+        return r2.Session; // carry into the code step
+      }
+      /* login step 3: submit the code */
+      async function submitCode(email, session, code) {
+        const r3 = await cognito("RespondToAuthChallenge", {
+          ChallengeName: "CUSTOM_CHALLENGE",
+          ClientId: CFG.clientId,
+          Session: session,
+          ChallengeResponses: { USERNAME: email, ANSWER: code },
+        });
+        if (!r3.AuthenticationResult)
+          throw new Error("Incorrect or expired code.");
+        storeTokens(r3.AuthenticationResult);
+        LS.email = email;
+      }
+      async function logout() {
+        const rt = LS.refresh;
+        LS.clear();
+        if (rt) {
+          try {
+            await cognito("RevokeToken", { Token: rt, ClientId: CFG.clientId });
+          } catch (e) {}
+        }
+        activeSession = null;
+        render();
+      }
+
+      /* ---------- ChargeLab API ---------- */
+      async function api(method, path, body, needAuth) {
+        const headers = {};
+        if (body) headers["content-type"] = "application/json";
+        if (needAuth) {
+          const t = await accessToken();
+          if (!t) throw new Error("Please sign in.");
+          headers["authorization"] = "Bearer " + t;
+        }
+        const r = await fetch(CFG.apiBase + path, {
+          method,
+          headers,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        if (r.status === 401 && needAuth) {
+          LS.access = null;
+          LS.exp = 0;
+          throw new Error("Session expired — sign in again.");
+        }
+        const txt = await r.text();
+        const j = txt ? JSON.parse(txt) : {};
+        if (!r.ok) {
+          const e = new Error(j.message || "HTTP " + r.status);
+          e.status = r.status;
+          throw e;
+        }
+        return j;
+      }
+      const getCharger = (name) =>
+        api(
+          "GET",
+          `/core/v1/chargers?filter_eq[name]=${encodeURIComponent(name)}&role=DRIVER`,
+          null,
+          false,
+        ).then((j) => j.entities && j.entities[0]);
+      const startSession = (chargerId, portId) =>
+        api(
+          "POST",
+          "/core/v1/sessions?role=DRIVER",
+          { startedVia: "WEB_APP", chargerId, portId },
+          true,
+        );
+      const stopSession = (sessionId) =>
+        api("POST", `/core/v1/sessions/${sessionId}/stop`, null, false);
+      const getSession = (sessionId) =>
+        api("GET", `/core/v1/sessions/${sessionId}`, null, false);
+      const activeSessions = () =>
+        api(
+          "GET",
+          "/core/v1/sessions?filter_eq[status]=CHARGING&role=DRIVER",
+          null,
+          true,
+        ).then((j) => j.entities || []);
+
+      /* ---------- UI state ---------- */
+      let activeSession = null; // { sessionId, chargerId, portId, status, chargerName }
+      let pollTimer = null;
+
+      function renderCharger(cfg, chg) {
+        const sec = el("section");
+        const price =
+          chg && chg.currentPrice
+            ? ` — $${chg.currentPrice.unitPrice}/kWh`
+            : "";
+        sec.append(
+          el("h2", { text: (cfg.label || (chg && chg.name)) + price }),
+        );
+        if (!chg) {
+          sec.append(el("p", { text: "Could not load." }));
+          return sec;
+        }
+        if (chg.location) sec.append(el("p", { text: chg.location.name }));
+
+        const ul = el("ul");
+        (chg.ports || []).forEach((p) => {
+          const loc =
+            (p.connectorLocations && p.connectorLocations[0]) ||
+            "Port " + p.portId;
+          const avail = (p.status || "").toUpperCase() === "AVAILABLE";
+          const mine =
+            activeSession &&
+            activeSession.chargerId === chg.chargerId &&
+            String(activeSession.portId) === String(p.portId);
+          const status = mine ? activeSession.status : p.status;
+          const li = el(
+            "li",
+            {},
+            `${loc} · ${p.connectorTypes ? p.connectorTypes.join("/") : ""} · ${p.maxPowerKilowatts || "?"} kW — ${titleCase(status)} `,
+          );
+          if (mine) {
+            li.append(
+              el("button", { type: "button", text: "Stop", onclick: doStop }),
+            );
+          } else if (avail && !activeSession) {
+            li.append(
+              el("button", {
+                type: "button",
+                text: isLoggedIn() ? "Start" : "Sign in to start",
+                onclick: () => (isLoggedIn() ? doStart(chg, p) : showLogin()),
+              }),
+            );
+          }
+          ul.append(li);
+        });
+        sec.append(ul);
+        return sec;
+      }
+
+      async function loadStatus() {
+        const wrap = $("#chargers");
+        // Placeholder only on first load (nothing rendered yet) — avoids a flash on refresh.
+        if (!wrap.children.length) wrap.append(el("p", { text: "Loading…" }));
+        const results = await Promise.all(
+          CFG.chargers.map((c) => getCharger(c.name).catch(() => null)),
+        );
+        // Build the new view fully, then swap it in one shot (no intermediate empty state).
+        const next = document.createDocumentFragment();
+        CFG.chargers.forEach((c, i) =>
+          next.append(renderCharger(c, results[i])),
+        );
+        next.append(
+          el("p", {}, [
+            el("button", {
+              type: "button",
+              text: "Refresh",
+              onclick: loadStatus,
+            }),
+          ]),
+        );
+        wrap.replaceChildren(next);
+      }
+
+      async function doStart(chg, port) {
+        banner(`Starting ${chg.name}…`);
+        try {
+          const s = await startSession(chg.chargerId, port.portId);
+          activeSession = {
+            sessionId: s.sessionId,
+            chargerId: chg.chargerId,
+            portId: s.portId || port.portId,
+            status: s.status || "PREPARING",
+            chargerName: chg.name,
+          };
+          banner("Session started — plug in your vehicle within ~90 seconds.");
+          startPolling();
+          render();
+        } catch (e) {
+          banner("Start failed: " + e.message);
+        }
+      }
+      async function doStop() {
+        if (!activeSession) return;
+        banner("Stopping…");
+        try {
+          await stopSession(activeSession.sessionId);
+          banner("Stop requested.");
+          setTimeout(() => {
+            activeSession = null;
+            stopPolling();
+            loadStatus();
+          }, 3000);
+        } catch (e) {
+          banner("Stop failed: " + e.message);
+        }
+      }
+
+      function startPolling() {
+        stopPolling();
+        pollTimer = setInterval(async () => {
+          if (!activeSession) return stopPolling();
+          try {
+            const s = await getSession(activeSession.sessionId);
+            activeSession.status = s.status || activeSession.status;
+            const done = [
+              "COMPLETED",
+              "STOPPED",
+              "ABORTED",
+              "FAULTED",
+              "CANCELLED",
+            ].includes((s.status || "").toUpperCase());
+            render();
+            if (done) {
+              activeSession = null;
+              stopPolling();
+              loadStatus();
+            }
+          } catch (e) {
+            /* keep trying */
+          }
+        }, 10000);
+      }
+      function stopPolling() {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = null;
+      }
+
+      /* ---------- Login UI ---------- */
+      let pendingSession = null,
+        pendingEmail = null;
+      function showLogin() {
+        $("#loginCard").hidden = false;
+        $("#email").focus();
+      }
+      function hideLogin() {
+        $("#loginCard").hidden = true;
+        $("#loginErr").textContent = "";
+      }
+      function resetLoginSteps() {
+        $("#step-code").hidden = true;
+        $("#step-email").hidden = false;
+        $("#loginErr").textContent = "";
+        pendingSession = null;
+      }
+      $("#sendBtn").addEventListener("click", async () => {
+        const email = $("#email").value.trim();
+        if (!email) return;
+        $("#sendBtn").disabled = true;
+        $("#sendBtn").textContent = "Sending…";
+        $("#loginErr").textContent = "";
+        try {
+          pendingEmail = email;
+          pendingSession = await requestCode(email);
+          $("#emailEcho").textContent = email;
+          $("#step-email").hidden = true;
+          $("#step-code").hidden = false;
+          $("#code").focus();
+        } catch (e) {
+          $("#loginErr").textContent = "Could not send code: " + e.message;
+        } finally {
+          $("#sendBtn").disabled = false;
+          $("#sendBtn").textContent = "Send code";
+        }
+      });
+      $("#verifyBtn").addEventListener("click", async () => {
+        const code = $("#code").value.trim();
+        if (!code) return;
+        $("#verifyBtn").disabled = true;
+        $("#verifyBtn").textContent = "Signing in…";
+        $("#loginErr").textContent = "";
+        try {
+          await submitCode(pendingEmail, pendingSession, code);
+          hideLogin();
+          resetLoginSteps();
+          banner("Signed in.");
+          setTimeout(() => banner(""), 1500);
+          render();
+          restoreActiveSession();
+        } catch (e) {
+          $("#loginErr").textContent = e.message;
+        } finally {
+          $("#verifyBtn").disabled = false;
+          $("#verifyBtn").textContent = "Sign in";
+        }
+      });
+      $("#restartLogin").addEventListener("click", resetLoginSteps);
+
+      /* ---------- top auth area ---------- */
+      function render() {
+        const a = $("#authArea");
+        a.innerHTML = "";
+        a.append(
+          isLoggedIn()
+            ? el("button", {
+                type: "button",
+                text: "Sign out",
+                onclick: logout,
+              })
+            : el("button", {
+                type: "button",
+                text: "Sign in",
+                onclick: showLogin,
+              }),
+        );
+        loadStatus();
+      }
+      async function restoreActiveSession() {
+        if (!isLoggedIn()) return;
+        try {
+          const list = await activeSessions();
+          if (list.length) {
+            const s = list[0];
+            activeSession = {
+              sessionId: s.sessionId,
+              chargerId: s.chargerId,
+              portId: s.portId,
+              status: s.status || "CHARGING",
+              chargerName: "",
+            };
+            startPolling();
+            loadStatus();
+          }
+        } catch (e) {}
+      }
+
+      /* ---------- boot ---------- */
+      render();
+      restoreActiveSession();
+    </script>
+  </body>
+</html>

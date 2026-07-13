@@ -21,6 +21,16 @@
     </header>
 
     <p id="banner"></p>
+    <form id="lookupForm">
+      <input
+        id="lookup"
+        type="text"
+        autocomplete="off"
+        autocapitalize="none"
+        placeholder="Add charger by ID, e.g. ax-33"
+      />
+      <button type="submit">Add</button>
+    </form>
     <div id="chargers"></div>
 
     <form id="loginCard" hidden>
@@ -65,6 +75,37 @@
           { name: "ax-63", label: "AX-63 (East)" },
         ],
       };
+      // User-added chargers (persisted) shown alongside the built-in ones.
+      const BUILTIN = new Set(CFG.chargers.map((c) => c.name));
+      const EXTRA = {
+        get() {
+          try {
+            return JSON.parse(localStorage.getItem("cl_extra")) || [];
+          } catch (e) {
+            return [];
+          }
+        },
+        set(l) {
+          localStorage.setItem("cl_extra", JSON.stringify(l));
+        },
+        has(name) {
+          return this.get().some((c) => c.name === name);
+        },
+        add(name, label) {
+          const l = this.get();
+          if (!l.some((c) => c.name === name)) {
+            l.push({ name, label });
+            this.set(l);
+          }
+        },
+        remove(name) {
+          this.set(this.get().filter((c) => c.name !== name));
+        },
+      };
+      const allChargers = () => [
+        ...CFG.chargers,
+        ...EXTRA.get().filter((c) => !BUILTIN.has(c.name)),
+      ];
       const LS = {
         get access() {
           return localStorage.getItem("cl_access");
@@ -278,9 +319,21 @@
           chg && chg.currentPrice
             ? ` — $${chg.currentPrice.unitPrice}/kWh`
             : "";
-        sec.append(
-          el("h2", { text: (cfg.label || (chg && chg.name)) + price }),
-        );
+        const h = el("h2", { text: (cfg.label || (chg && chg.name)) + price });
+        if (!BUILTIN.has(cfg.name)) {
+          h.append(" ");
+          h.append(
+            el("button", {
+              type: "button",
+              text: "remove",
+              onclick: () => {
+                EXTRA.remove(cfg.name);
+                loadStatus();
+              },
+            }),
+          );
+        }
+        sec.append(h);
         if (!chg) {
           sec.append(el("p", { text: "Could not load." }));
           return sec;
@@ -326,14 +379,13 @@
         const wrap = $("#chargers");
         // Placeholder only on first load (nothing rendered yet) — avoids a flash on refresh.
         if (!wrap.children.length) wrap.append(el("p", { text: "Loading…" }));
+        const list = allChargers();
         const results = await Promise.all(
-          CFG.chargers.map((c) => getCharger(c.name).catch(() => null)),
+          list.map((c) => getCharger(c.name).catch(() => null)),
         );
         // Build the new view fully, then swap it in one shot (no intermediate empty state).
         const next = document.createDocumentFragment();
-        CFG.chargers.forEach((c, i) =>
-          next.append(renderCharger(c, results[i])),
-        );
+        list.forEach((c, i) => next.append(renderCharger(c, results[i])));
         next.append(
           el("p", {}, [
             el("button", {
@@ -507,6 +559,32 @@
           }
         } catch (e) {}
       }
+
+      /* ---------- add-charger lookup ---------- */
+      $("#lookupForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const name = $("#lookup").value.trim().toLowerCase();
+        if (!name) return;
+        if (BUILTIN.has(name) || EXTRA.has(name)) {
+          banner("That charger is already listed.");
+          $("#lookup").value = "";
+          return;
+        }
+        banner(`Looking up ${name}…`);
+        try {
+          const chg = await getCharger(name);
+          if (!chg) {
+            banner(`No charger found for "${name}".`);
+            return;
+          }
+          EXTRA.add(name, (chg.name || name).toUpperCase());
+          $("#lookup").value = "";
+          banner("");
+          loadStatus();
+        } catch (err) {
+          banner("Lookup failed: " + err.message);
+        }
+      });
 
       /* ---------- boot ---------- */
       render();

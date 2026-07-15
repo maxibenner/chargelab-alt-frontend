@@ -139,6 +139,15 @@
             ? localStorage.setItem("cl_email", v)
             : localStorage.removeItem("cl_email");
         },
+        // Active session id — outlives login since session GET/stop are unauthenticated.
+        get session() {
+          return localStorage.getItem("cl_session");
+        },
+        set session(v) {
+          v
+            ? localStorage.setItem("cl_session", v)
+            : localStorage.removeItem("cl_session");
+        },
         clear() {
           ["cl_access", "cl_exp", "cl_refresh", "cl_email"].forEach((k) =>
             localStorage.removeItem(k),
@@ -167,6 +176,29 @@
       };
       const titleCase = (s) =>
         s ? s.charAt(0) + s.slice(1).toLowerCase() : "Unknown";
+      const STATUS_LABEL = { SESSION: "In use", PREPARING: "Starting…" };
+      const statusLabel = (s) =>
+        STATUS_LABEL[(s || "").toUpperCase()] || titleCase(s);
+      const TERMINAL = [
+        "COMPLETED",
+        "STOPPED",
+        "ABORTED",
+        "FAULTED",
+        "CANCELLED",
+      ];
+      const fmtDur = (secs) => {
+        const m = Math.floor((secs || 0) / 60);
+        return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+      };
+      const PRICE_SUFFIX = {
+        BILLED_BY_KWH: "/kWh",
+        BILLED_BY_EFFECTIVE_CHARGING_TIME: "/hr charging",
+        BILLED_BY_TIME_PLUGGED_IN: "/hr plugged in",
+      };
+      const priceLabel = (cp) =>
+        `$${cp.unitPrice.toFixed(2)}${PRICE_SUFFIX[cp.pricingType] || ""}`;
+      const totalsLine = (t) =>
+        `${(t.consumedEnergyKilowattHours || 0).toFixed(2)} kWh · $${(t.cost || 0).toFixed(2)} · plugged in ${fmtDur(t.pluggedInTimeSeconds)}`;
       // Build a maps link that opens the platform's default maps app.
       const IS_APPLE = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent);
       function mapsUrl(loc) {
@@ -268,7 +300,8 @@
             await cognito("RevokeToken", { Token: rt, ClientId: CFG.clientId });
           } catch (e) {}
         }
-        activeSession = null;
+        payMethod = undefined;
+        // Keep tracking a running session — status polling and stop work signed out.
         render();
       }
 
@@ -333,9 +366,7 @@
       function renderCharger(cfg, chg) {
         const sec = el("section");
         const price =
-          chg && chg.currentPrice
-            ? ` — $${chg.currentPrice.unitPrice}/kWh`
-            : "";
+          chg && chg.currentPrice ? ` — ${priceLabel(chg.currentPrice)}` : "";
         const h = el("h2", { text: (cfg.label || (chg && chg.name)) + price });
         if (!BUILTIN.has(cfg.name)) {
           h.append(" ");
@@ -355,6 +386,8 @@
           sec.append(el("p", { text: "Could not load." }));
           return sec;
         }
+        if (chg.maintenanceFlag)
+          sec.append(el("p", { text: "⚠ Under maintenance" }));
         if (chg.location) {
           const loc = chg.location;
           sec.append(el("p", { text: loc.name }));
@@ -408,12 +441,20 @@
           const li = el(
             "li",
             {},
-            `${loc} · ${p.connectorTypes ? p.connectorTypes.join("/") : ""} · ${p.maxPowerKilowatts || "?"} kW — ${titleCase(status)} `,
+            `${loc} · ${p.connectorTypes ? p.connectorTypes.join("/") : ""} · ${p.maxPowerKilowatts || "?"} kW — ${statusLabel(status)} `,
           );
           if (mine) {
             li.append(
-              el("button", { type: "button", text: "Stop", onclick: doStop }),
+              activeSession.stopInitiated
+                ? el("em", { text: "Stopping…" })
+                : el("button", {
+                    type: "button",
+                    text: "Stop",
+                    onclick: doStop,
+                  }),
             );
+            if (activeSession.totals)
+              li.append(el("p", { text: totalsLine(activeSession.totals) }));
           } else if (avail && !activeSession) {
             li.append(
               el("button", {
@@ -461,8 +502,11 @@
             chargerId: chg.chargerId,
             portId: s.portId || port.portId,
             status: s.status || "PREPARING",
+            stopInitiated: false,
+            totals: null,
             chargerName: chg.name,
           };
+          LS.session = s.sessionId;
           banner("Session started — plug in your vehicle within ~90 seconds.");
           startPolling();
           render();
@@ -475,12 +519,11 @@
         banner("Stopping…");
         try {
           await stopSession(activeSession.sessionId);
-          banner("Stop requested.");
-          setTimeout(() => {
-            activeSession = null;
-            stopPolling();
-            loadStatus();
-          }, 3000);
+          // The charger keeps CHARGING (with stopInitiated) for a while after
+          // the stop request — keep polling until a terminal status arrives.
+          activeSession.stopInitiated = true;
+          banner("Stop requested — waiting for the charger to finish.");
+          render();
         } catch (e) {
           banner("Stop failed: " + e.message);
         }
@@ -493,23 +536,21 @@
           try {
             const s = await getSession(activeSession.sessionId);
             activeSession.status = s.status || activeSession.status;
-            const done = [
-              "COMPLETED",
-              "STOPPED",
-              "ABORTED",
-              "FAULTED",
-              "CANCELLED",
-            ].includes((s.status || "").toUpperCase());
-            render();
+            activeSession.totals = s.runningTotals || activeSession.totals;
+            if (s.stopInitiated) activeSession.stopInitiated = true;
+            const done = TERMINAL.includes((s.status || "").toUpperCase());
             if (done) {
+              const t = activeSession.totals;
+              banner(t ? "Session ended — " + totalsLine(t) : "Session ended.");
               activeSession = null;
+              LS.session = null;
               stopPolling();
-              loadStatus();
             }
+            render();
           } catch (e) {
             /* keep trying */
           }
-        }, 10000);
+        }, 5000);
       }
       function stopPolling() {
         if (pollTimer) clearInterval(pollTimer);
@@ -567,6 +608,7 @@
           setTimeout(() => banner(""), 1500);
           render();
           restoreActiveSession();
+          loadPayMethod();
         } catch (e) {
           $("#loginErr").textContent = e.message;
         } finally {
@@ -575,6 +617,18 @@
         }
       });
       $("#restartLogin").addEventListener("click", resetLoginSteps);
+
+      /* ---------- payment method (display only; manage at charge.id) ---------- */
+      let payMethod; // undefined = not loaded, null = none on file
+      async function loadPayMethod() {
+        if (!isLoggedIn()) return;
+        try {
+          const j = await api("GET", "/payment-methods", null, true);
+          const list = j.payload || [];
+          payMethod = list.find((p) => p.isDefault) || list[0] || null;
+          render();
+        } catch (e) {}
+      }
 
       /* ---------- top auth area ---------- */
       function render() {
@@ -593,9 +647,41 @@
                 onclick: showLogin,
               }),
         );
+        if (isLoggedIn() && payMethod !== undefined) {
+          a.append(
+            " ",
+            payMethod
+              ? `${payMethod.brand} ••${payMethod.last4}` +
+                  (payMethod.expiredStatus === "EXPIRED" ? " (expired)" : "")
+              : "No payment method — add one at charge.id",
+          );
+        }
         loadStatus();
       }
       async function restoreActiveSession() {
+        // A session started here is remembered by id — the CHARGING filter
+        // below returns nothing while it is still PREPARING, and this path
+        // works signed out too (session GET is unauthenticated).
+        if (LS.session && !activeSession) {
+          try {
+            const s = await getSession(LS.session);
+            if (!TERMINAL.includes((s.status || "").toUpperCase())) {
+              activeSession = {
+                sessionId: s.sessionId,
+                chargerId: s.chargerId,
+                portId: s.portId,
+                status: s.status || "PREPARING",
+                stopInitiated: !!s.stopInitiated,
+                totals: s.runningTotals || null,
+                chargerName: "",
+              };
+              startPolling();
+              loadStatus();
+              return;
+            }
+            LS.session = null;
+          } catch (e) {}
+        }
         if (!isLoggedIn()) return;
         try {
           const list = await activeSessions();
@@ -606,8 +692,11 @@
               chargerId: s.chargerId,
               portId: s.portId,
               status: s.status || "CHARGING",
+              stopInitiated: !!s.stopInitiated,
+              totals: s.runningTotals || null,
               chargerName: "",
             };
+            LS.session = s.sessionId;
             startPolling();
             loadStatus();
           }
@@ -643,6 +732,7 @@
       /* ---------- boot ---------- */
       render();
       restoreActiveSession();
+      loadPayMethod();
     </script>
   </body>
 </html>

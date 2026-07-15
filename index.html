@@ -70,6 +70,8 @@
         cognitoUrl: "https://cognito-idp.us-east-1.amazonaws.com/",
         clientId: "70ecu0f57h1e5n9cg7vitjqtqs",
         apiBase: "https://api-v1-blue.chargelab.io",
+        // Both built-in chargers share this location — one request fetches them all.
+        locationId: "28f4cf8a-d27e-4e24-a59f-819611e75411",
         chargers: [
           { name: "ax-62", label: "AX-62 (West)" },
           { name: "ax-63", label: "AX-63 (East)" },
@@ -364,7 +366,11 @@
 
       /* ---------- UI state ---------- */
       let activeSession = null; // { sessionId, chargerId, portId, status, chargerName }
-      let pollTimer = null;
+      let pollTimer = null,
+        pollBusy = false;
+      // Charger data is cached so poll ticks re-render without re-fetching it.
+      let chargerData = []; // [{ cfg, chg }]
+      let chargerFetchedAt = 0;
 
       function renderCharger(cfg, chg) {
         const sec = el("section");
@@ -379,7 +385,8 @@
               text: "remove",
               onclick: () => {
                 EXTRA.remove(cfg.name);
-                loadStatus();
+                chargerData = chargerData.filter((d) => d.cfg.name !== cfg.name);
+                renderChargers();
               },
             }),
           );
@@ -479,27 +486,54 @@
         return sec;
       }
 
-      async function loadStatus() {
+      function renderChargers() {
         const wrap = $("#chargers");
-        // Placeholder only on first load (nothing rendered yet) — avoids a flash on refresh.
-        if (!wrap.children.length) wrap.append(el("p", { text: "Loading…" }));
-        const list = allChargers();
-        const results = await Promise.all(
-          list.map((c) => getCharger(c.name).catch(() => null)),
-        );
+        // Placeholder until the first fetch lands.
+        if (!chargerFetchedAt) {
+          if (!wrap.children.length) wrap.append(el("p", { text: "Loading…" }));
+          return;
+        }
         // Build the new view fully, then swap it in one shot (no intermediate empty state).
         const next = document.createDocumentFragment();
-        list.forEach((c, i) => next.append(renderCharger(c, results[i])));
+        chargerData.forEach((d) => next.append(renderCharger(d.cfg, d.chg)));
         next.append(
           el("p", {}, [
             el("button", {
               type: "button",
               text: "Refresh",
-              onclick: loadStatus,
+              onclick: refreshChargers,
             }),
           ]),
         );
         wrap.replaceChildren(next);
+      }
+      async function refreshChargers() {
+        const list = allChargers();
+        // One request covers every charger at the built-in location; only
+        // extras elsewhere need their own per-name lookup.
+        const byName = {};
+        try {
+          const j = await api(
+            "GET",
+            `/core/v1/chargers?filter_eq[locationId]=${CFG.locationId}&role=DRIVER`,
+            null,
+            false,
+          );
+          (j.entities || []).forEach(
+            (c) => (byName[(c.name || "").toLowerCase()] = c),
+          );
+        } catch (e) {}
+        const rest = await Promise.all(
+          list.map((c) =>
+            byName[c.name] ? null : getCharger(c.name).catch(() => null),
+          ),
+        );
+        chargerData = list.map((c, i) => ({
+          cfg: c,
+          chg: byName[c.name] || rest[i],
+        }));
+        chargerFetchedAt = Date.now();
+        renderChargers();
       }
 
       async function doStart(chg, port) {
@@ -538,32 +572,52 @@
         }
       }
 
+      // Poll fast (5s) only while waiting on a transition (starting/stopping);
+      // steady charging polls at 15s, and not at all while the tab is hidden.
       function startPolling() {
         stopPolling();
-        pollTimer = setInterval(async () => {
-          if (!activeSession) return stopPolling();
-          try {
-            const s = await getSession(activeSession.sessionId);
-            activeSession.status = s.status || activeSession.status;
-            activeSession.totals = s.runningTotals || activeSession.totals;
-            if (s.stopInitiated) activeSession.stopInitiated = true;
-            const done = TERMINAL.includes((s.status || "").toUpperCase());
-            if (done) {
-              stopPolling();
-              banner(await sessionSummary(s, activeSession.totals));
-              activeSession = null;
-              LS.session = null;
-            }
-            render();
-          } catch (e) {
-            /* keep trying */
-          }
-        }, 5000);
+        if (!activeSession || document.hidden) return;
+        const fast =
+          activeSession.stopInitiated ||
+          (activeSession.status || "").toUpperCase() !== "CHARGING";
+        pollTimer = setTimeout(pollOnce, fast ? 5000 : 15000);
       }
       function stopPolling() {
-        if (pollTimer) clearInterval(pollTimer);
+        if (pollTimer) clearTimeout(pollTimer);
         pollTimer = null;
       }
+      async function pollOnce() {
+        if (!activeSession || pollBusy) return;
+        pollBusy = true;
+        try {
+          const s = await getSession(activeSession.sessionId);
+          activeSession.status = s.status || activeSession.status;
+          activeSession.totals = s.runningTotals || activeSession.totals;
+          if (s.stopInitiated) activeSession.stopInitiated = true;
+          if (TERMINAL.includes((s.status || "").toUpperCase())) {
+            banner(await sessionSummary(s, activeSession.totals));
+            activeSession = null;
+            LS.session = null;
+            render();
+            refreshChargers(); // port statuses changed
+          } else {
+            render();
+          }
+        } catch (e) {
+          /* keep trying */
+        } finally {
+          pollBusy = false;
+          startPolling();
+        }
+      }
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+          stopPolling();
+        } else {
+          if (activeSession) pollOnce();
+          if (Date.now() - chargerFetchedAt > 600000) refreshChargers();
+        }
+      });
       // The terminal session response drops runningTotals — the final billed
       // numbers live on the completed transaction instead.
       async function sessionSummary(s, lastTotals) {
@@ -629,6 +683,7 @@
           banner("Signed in.");
           setTimeout(() => banner(""), 1500);
           render();
+          refreshChargers();
           restoreActiveSession();
           loadPayMethod();
         } catch (e) {
@@ -678,7 +733,7 @@
               : "No payment method — add one at charge.id",
           );
         }
-        loadStatus();
+        renderChargers();
       }
       async function restoreActiveSession() {
         // A session started here is remembered by id — the CHARGING filter
@@ -698,7 +753,7 @@
                 chargerName: "",
               };
               startPolling();
-              loadStatus();
+              renderChargers();
               return;
             }
             // Ended while the page was closed — show the final bill once.
@@ -722,7 +777,7 @@
             };
             LS.session = s.sessionId;
             startPolling();
-            loadStatus();
+            renderChargers();
           }
         } catch (e) {}
       }
@@ -744,10 +799,13 @@
             banner(`No charger found for "${name}".`);
             return;
           }
-          EXTRA.add(name, (chg.name || name).toUpperCase());
+          const label = (chg.name || name).toUpperCase();
+          EXTRA.add(name, label);
+          // Already have the data from the lookup — no need to refetch.
+          chargerData.push({ cfg: { name, label }, chg });
           $("#lookup").value = "";
           banner("");
-          loadStatus();
+          renderChargers();
         } catch (err) {
           banner("Lookup failed: " + err.message);
         }
@@ -755,6 +813,7 @@
 
       /* ---------- boot ---------- */
       render();
+      refreshChargers();
       restoreActiveSession();
       loadPayMethod();
     </script>

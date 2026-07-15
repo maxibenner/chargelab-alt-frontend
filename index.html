@@ -180,6 +180,7 @@
       const statusLabel = (s) =>
         STATUS_LABEL[(s || "").toUpperCase()] || titleCase(s);
       const TERMINAL = [
+        "SUCCESSFUL",
         "COMPLETED",
         "STOPPED",
         "ABORTED",
@@ -358,6 +359,8 @@
           null,
           true,
         ).then((j) => j.entities || []);
+      const getCompletedTransaction = (txId) =>
+        api("GET", `/core/v1/completedTransactions/${txId}`, null, false);
 
       /* ---------- UI state ---------- */
       let activeSession = null; // { sessionId, chargerId, portId, status, chargerName }
@@ -456,13 +459,19 @@
             if (activeSession.totals)
               li.append(el("p", { text: totalsLine(activeSession.totals) }));
           } else if (avail && !activeSession) {
-            li.append(
-              el("button", {
-                type: "button",
-                text: isLoggedIn() ? "Start" : "Sign in to start",
-                onclick: () => (isLoggedIn() ? doStart(chg, p) : showLogin()),
-              }),
-            );
+            if (isLoggedIn() && chg.requirePaymentMethod && payMethod === null) {
+              li.append(
+                el("em", { text: "Add a payment method at charge.id to start" }),
+              );
+            } else {
+              li.append(
+                el("button", {
+                  type: "button",
+                  text: isLoggedIn() ? "Start" : "Sign in to start",
+                  onclick: () => (isLoggedIn() ? doStart(chg, p) : showLogin()),
+                }),
+              );
+            }
           }
           ul.append(li);
         });
@@ -540,11 +549,10 @@
             if (s.stopInitiated) activeSession.stopInitiated = true;
             const done = TERMINAL.includes((s.status || "").toUpperCase());
             if (done) {
-              const t = activeSession.totals;
-              banner(t ? "Session ended — " + totalsLine(t) : "Session ended.");
+              stopPolling();
+              banner(await sessionSummary(s, activeSession.totals));
               activeSession = null;
               LS.session = null;
-              stopPolling();
             }
             render();
           } catch (e) {
@@ -555,6 +563,20 @@
       function stopPolling() {
         if (pollTimer) clearInterval(pollTimer);
         pollTimer = null;
+      }
+      // The terminal session response drops runningTotals — the final billed
+      // numbers live on the completed transaction instead.
+      async function sessionSummary(s, lastTotals) {
+        const label = statusLabel(s.status).toLowerCase();
+        if (s.transactionId) {
+          try {
+            const tx = await getCompletedTransaction(s.transactionId);
+            return `Session ${label} — ${(tx.consumedEnergyKilowattHours || 0).toFixed(2)} kWh, $${(tx.billedTotalAmount || 0).toFixed(2)} billed.`;
+          } catch (e) {}
+        }
+        return lastTotals
+          ? `Session ${label} — ` + totalsLine(lastTotals)
+          : `Session ${label}.`;
       }
 
       /* ---------- Login UI ---------- */
@@ -679,7 +701,9 @@
               loadStatus();
               return;
             }
+            // Ended while the page was closed — show the final bill once.
             LS.session = null;
+            banner(await sessionSummary(s, s.runningTotals));
           } catch (e) {}
         }
         if (!isLoggedIn()) return;
